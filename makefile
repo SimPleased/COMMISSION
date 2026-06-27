@@ -3,6 +3,7 @@ CUBIOMES_SRC := $(addprefix cubiomes/,biomenoise.c biomes.c finders.c generator.
 LARGE_BIOMES ?= 0
 UNBOUND ?= 0
 PRINT_INTERVAL ?= 256
+AMD_GPU        ?= 0
 # Auto-detect GPU architecture:
 # - RTX 40xx/50xx series: sm_89 is faster than native sm_120
 # - Everything else: use native
@@ -22,21 +23,28 @@ $(info Using ARCH = $(ARCH))
 override CFLAGS += -O3
 override CXXFLAGS += -O3 -std=c++20 -I asio/asio/include -DOMISSION_LARGE_BIOMES=$(LARGE_BIOMES) -DOMISSION_UNBOUND=$(UNBOUND) -DPRINT_INTERVAL=$(PRINT_INTERVAL)
 override NVCC_FLAGS += $(CXXFLAGS) --expt-relaxed-constexpr --default-stream per-thread -arch=$(ARCH) -use_fast_math
+override HIPCC_FLAGS += $(CXXFLAGS) --offload-arch=native -ffast-math -fcuda-flush-denormals-to-zero -munsafe-fp-atomics
 
 ifeq ($(OS),Windows_NT)
 all: main.exe
 
 SRC_CPP := $(wildcard src/*.cpp)
 SRC_C   := $(wildcard src/*.c)
-SRC_CU  := $(wildcard src/*.cu)
-SRC     := $(SRC_CPP) $(SRC_C) $(SRC_CU)
+ifeq ($(AMD_GPU),1)
+    SRC_GPU := src/gpu.hip
+else
+    SRC_GPU := src/gpu.cu
+endif
+SRC := $(SRC_CPP) $(SRC_C) $(SRC_GPU)
 
 clean:
 	del /Q main.exe
 
 # nvcc src/*.cpp src/*.c src/*.cu -o main.exe cubiomes/biomenoise.c cubiomes/biomes.c cubiomes/finders.c cubiomes/generator.c cubiomes/layers.c cubiomes/noise.c -arch=native -O3 -std=c++20 -I asio-1.34.2/include -DOMISSION_LARGE_BIOMES=1 --expt-relaxed-constexpr --default-stream per-thread -D_WIN32_WINNT=0x0601
 main.exe: $(SRC) $(CUBIOMES_SRC)
-	nvcc $(SRC) $(CUBIOMES_SRC) -o $@ $(NVCC_FLAGS) -D_WIN32_WINNT=0x0601
+	$(if $(filter 1,$(AMD_GPU)),\
+        hipcc $(SRC) $(CUBIOMES_SRC) -o $@ $(HIPCC_FLAGS) -D_WIN32_WINNT=0x0601,\
+        nvcc $(SRC) $(CUBIOMES_SRC) -o $@ $(NVCC_FLAGS) -D_WIN32_WINNT=0x0601)
 else
 override NVCC_FLAGS += -ccbin $(CXX)
 
@@ -44,10 +52,17 @@ MAIN_SRC := src/main.cpp
 MAIN_DEP := $(MAIN_SRC) src/common.h
 
 ifndef NO_GPU
-	MAIN_SRC += gpu.o
-	MAIN_DEP += gpu.o src/gpu.h
-	MAIN_CXX := nvcc
-	MAIN_CXXFLAGS += $(NVCC_FLAGS)
+        MAIN_SRC += gpu.o
+        MAIN_DEP += gpu.o src/gpu.h
+        ifeq ($(AMD_GPU),1)
+            MAIN_CXX      := hipcc
+            MAIN_CXXFLAGS += $(HIPCC_FLAGS)
+            GPU_SRC       := src/gpu.hip
+        else
+            MAIN_CXX      := nvcc
+            MAIN_CXXFLAGS += $(NVCC_FLAGS)
+            GPU_SRC       := src/gpu.cu
+        endif
 else
 	MAIN_CXX := $(CXX)
 	MAIN_CXXFLAGS += $(CXXFLAGS) -DNO_GPU
@@ -79,8 +94,8 @@ libcubiomes.a: $(CUBIOMES_SRC)
 cubiomes.o: src/cubiomes.c src/cubiomes.h
 	$(CC) -c $< -o $@ $(CFLAGS)
 
-gpu.o: src/gpu.cu src/gpu.h src/common.h src/Random.h src/kernel_0A.h src/kernel_0B.h
-	nvcc -c $< -o $@ $(NVCC_FLAGS)
+gpu.o: $(GPU_SRC) src/gpu.h src/common.h src/Random.h src/kernel_0A.h src/kernel_0B.h
+	$(MAIN_CXX) -c $< -o $@ $(MAIN_CXXFLAGS)
 
 cpu.o: src/cpu.cpp src/cpu.h src/common.h src/cubiomes.h
 	$(CXX) -c $< -o $@ $(CXXFLAGS)
