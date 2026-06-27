@@ -19,6 +19,11 @@
 #include <charconv>
 #include <algorithm>
 #include <random>
+#include <atomic>
+#include <csignal>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
 
 #ifdef NO_GPU
 constexpr bool no_gpu = true;
@@ -82,6 +87,7 @@ struct Args {
     std::optional<HostService> server;
     std::optional<std::string> output_file;
     std::optional<int64_t> start_seed;
+    std::optional<int64_t> stop_seed;
     std::optional<int32_t> min_size;
 
     bool parse(int argc, const char **const argv) {
@@ -130,6 +136,8 @@ struct Args {
                 output_file = argv[i++];
             } else if (std::strcmp("--start", arg) == 0) {
                 if (!parse_argument_int(argc, argv, i, start_seed, [](int64_t start_seed){ return true; }, arg)) return false;
+            } else if (std::strcmp("--stop", arg) == 0) {
+                if (!parse_argument_int(argc, argv, i, stop_seed, [](int64_t stop_seed){ return true; }, arg)) return false;
             } else if (std::strcmp("--size", arg) == 0) {
                 if (!parse_argument_int(argc, argv, i, min_size, [](int32_t min_size){ return min_size >= 0; }, arg)) return false;
             } else {
@@ -171,18 +179,179 @@ uint64_t random_start_seed() {
     return ((uint64_t)device() << 32) + (uint64_t)device();
 }
 
+namespace {
+volatile std::sig_atomic_t g_interrupted = 0;
+
+void handle_signal(int) {
+    g_interrupted = 1;
+}
+
+struct SearchResult {
+    int64_t seed = 0;
+    int32_t x = 0;
+    int32_t z = 0;
+    int32_t size = 0;
+};
+
+std::string join_devices(const std::vector<int> &devices) {
+    if (devices.empty()) {
+        return "(none)";
+    }
+
+    std::string result;
+    for (size_t i = 0; i < devices.size(); ++i) {
+        if (i != 0) {
+            result += ", ";
+        }
+        result += std::to_string(devices[i]);
+    }
+    return result;
+}
+
+std::string platform_name(bool large_biomes) {
+    return large_biomes ? "java_1_21_5_lb" : "java_1_21_5";
+}
+
+std::string make_chunkbase_url(int64_t seed, int32_t x, int32_t z, bool large_biomes) {
+    return "https://www.chunkbase.com/apps/seed-map#seed=" + std::to_string(seed) +
+           "&platform=" + platform_name(large_biomes) +
+           "&dimension=overworld&x=" + std::to_string(x) +
+           "&z=" + std::to_string(z) +
+           "&zoom=0.125";
+}
+
+std::string make_mcseedmap_url(int64_t seed, int32_t x, int32_t z, bool large_biomes) {
+    const std::string base = large_biomes
+        ? "https://mcseedmap.net/1.21.5-Java/lb/"
+        : "https://mcseedmap.net/1.21.5-Java/";
+    return base + std::to_string(seed) +
+           "#x=" + std::to_string(x) +
+           "&z=" + std::to_string(z) +
+           "&l=-3";
+}
+
+std::string current_finding_tag() {
+    if (unbound) {
+        return large_biomes ? "ULB" : "USB";
+    }
+    return large_biomes ? "LB" : "SB";
+}
+
+bool parse_result_line(const std::string &line, const std::string &expected_tag, SearchResult &out, std::string &tag) {
+    std::istringstream iss(line);
+    std::string first;
+    if (!(iss >> first)) {
+        return false;
+    }
+
+    if (first == "USB" || first == "SB" || first == "ULB" || first == "LB") {
+        tag = first;
+        return static_cast<bool>(iss >> out.seed >> out.x >> out.z >> out.size);
+    }
+
+    tag = expected_tag;
+    try {
+        out.seed = std::stoll(first);
+    } catch (...) {
+        return false;
+    }
+    return static_cast<bool>(iss >> out.x >> out.z >> out.size);
+}
+
+void write_result_line(std::FILE *file, const SearchResult &result) {
+    const std::string tag = current_finding_tag();
+    std::fprintf(file, "%s %" PRIi64 " %" PRIi32 " %" PRIi32 " %" PRIi32 "\n",
+                 tag.c_str(), result.seed, result.x, result.z, result.size);
+}
+
+void print_result_card(const SearchResult &r, bool large_biomes, size_t rank = 0) {
+    if (rank != 0) {
+        std::printf("%2zu) ", rank);
+    } else {
+        std::printf("Found: ");
+    }
+    std::printf("seed=%" PRIi64 "  x=%" PRIi32 "  z=%" PRIi32 "  size=%" PRIi32 "\n",
+                r.seed, r.x, r.z, r.size);
+    std::printf("   Chunkbase : %s\n", make_chunkbase_url(r.seed, r.x, r.z, large_biomes).c_str());
+    std::printf("   tmcseedmap : %s\n", make_mcseedmap_url(r.seed, r.x, r.z, large_biomes).c_str());
+}
+
+void print_top_results_from_file(const std::string &path, bool large_biomes) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        std::printf("\nCould not reopen %s to build the top results summary.\n", path.c_str());
+        return;
+    }
+
+    const std::string expected_tag = current_finding_tag();
+    std::vector<SearchResult> results;
+    std::string line;
+    while (std::getline(file, line)) {
+        SearchResult result;
+        std::string tag;
+        if (parse_result_line(line, expected_tag, result, tag) && tag == expected_tag) {
+            results.push_back(result);
+        }
+    }
+
+    if (results.empty()) {
+        std::printf("\nNo saved results were found for %s in %s.\n", expected_tag.c_str(), path.c_str());
+        return;
+    }
+
+    std::sort(results.begin(), results.end(), [](const SearchResult &a, const SearchResult &b) {
+        if (a.size != b.size) return a.size > b.size;
+        if (a.seed != b.seed) return a.seed < b.seed;
+        if (a.x != b.x) return a.x < b.x;
+        return a.z < b.z;
+    });
+
+    results.erase(std::unique(results.begin(), results.end(), [](const SearchResult &a, const SearchResult &b) {
+        return a.seed == b.seed && a.x == b.x && a.z == b.z && a.size == b.size;
+    }), results.end());
+
+    const size_t count = std::min<size_t>(10, results.size());
+    std::printf("\n============================================================\n");
+    std::printf("Top %zu results for %s from %s\n", count, expected_tag.c_str(), path.c_str());
+    std::printf("============================================================\n");
+    for (size_t i = 0; i < count; ++i) {
+        print_result_card(results[i], large_biomes, i + 1);
+    }
+    std::printf("============================================================\n");
+}
+
+void print_banner(const Args &args, int threads, int32_t min_size, const std::string &output_path, uint64_t start_seed) {
+    std::printf("============================================================\n");
+    std::printf("Minecraft Mushroom Island Search\n");
+    std::printf("============================================================\n");
+    std::printf("large_biomes    : %s\n", large_biomes ? "true" : "false");
+    std::printf("unbound         : %s\n", unbound ? "true" : "false");
+    std::printf("print interval  : %d\n", PRINT_INTERVAL);
+    std::printf("GPU devices     : %s\n", join_devices(args.devices).c_str());
+    std::printf("finding type    : %s\n", current_finding_tag().c_str());
+    std::printf("CPU threads     : %d\n", threads);
+    std::printf("min size        : %" PRIi32 "\n", min_size);
+    std::printf("output file     : %s\n", output_path.c_str());
+    std::printf("start seed      : %" PRIu64 "\n", start_seed);
+    if (args.stop_seed.has_value()) {
+        std::printf("stop seed       : %" PRIi64 "\n", args.stop_seed.value());
+    } else {
+        std::printf("stop seed       : (none)\n\n");
+    }
+    std::printf("press Ctrl+C for a ranked summary of the best saved results\n");
+    std::printf("============================================================\n\n");
+}
+
+}  // namespace
+
 int main_inner(int argc, char **argv) {
     Args args{};
     if (!args.parse(argc, const_cast<const char **const>(argv))) {
-        std::fprintf(stderr, "Usage:\n%s [--device <device>,<device>,...] [--threads <threads>] [--client <server_address>] [--server <listen_address>] [--output <output_file>] [--start <start_seed>] [--size <min_size>]\n", argv[0]);
+        std::fprintf(stderr, "Usage:\n%s [--device <device>,<device>,...] [--threads <threads>] [--client <server_address>] [--server <listen_address>] [--output <output_file>] [--start <start_seed>] [--stop <stop_seed>] [--size <min_size>]\n", argv[0]);
         return 1;
     }
 
     const int threads = args.threads.value_or(args.client ? 0 : 1);
-    int32_t min_size = args.min_size.value_or(10'000'000 * (large_biomes ? 16 : 1));
-    if (threads != 0) {
-        std::printf("min_size = %" PRIi32 "\n", min_size);
-    }
 
     if (no_gpu && args.devices.size() != 0) {
         std::fprintf(stderr, "The program was compiled without gpu support\n");
@@ -197,27 +366,32 @@ int main_inner(int argc, char **argv) {
         return 1;
     }
 
-    std::printf("Hello! large_biomes = %s\nunbound: %s\nprint interval: %d\n", large_biomes ? "true" : "false", unbound ? "true" : "false", PRINT_INTERVAL);
+    std::signal(SIGINT, handle_signal);
+    std::signal(SIGTERM, handle_signal);
+
+    int32_t min_size = args.min_size.value_or(6'000'000 * (large_biomes ? 16 : 1));
+    const std::string output_file_path = args.output_file ? args.output_file.value() : "output.txt";
+    const uint64_t start_seed = args.start_seed.value_or(random_start_seed());
 
     std::FILE *output_file = nullptr;
     if (threads != 0) {
-        const char *output_file_path = args.output_file ? args.output_file.value().c_str() : "output.txt";
-        output_file = std::fopen(output_file_path, "a");
+        output_file = std::fopen(output_file_path.c_str(), "a");
         if (output_file == nullptr) {
-            std::fprintf(stderr, "Could not open %s\n", output_file_path);
+            std::fprintf(stderr, "Could not open %s\n", output_file_path.c_str());
             return 1;
         }
+        std::setvbuf(output_file, nullptr, _IOFBF, 1 << 20);
         std::fprintf(output_file, "\n");
         std::fflush(output_file);
     }
+
+    print_banner(args, threads, min_size, output_file_path, start_seed);
 
     GpuOutputs gpu_outputs;
     CpuOutputs cpu_outputs;
 
 #ifndef NO_GPU
-    uint64_t start_seed = args.start_seed.value_or(random_start_seed());
-    std::printf("Starting from %" PRIi64 "\n", start_seed);
-    SeedIterator seed_range(start_seed);
+    SeedIterator seed_range(start_seed, args.stop_seed);
 
     std::vector<std::unique_ptr<GpuThread>> gpu_threads;
     for (int device : args.devices) {
@@ -244,24 +418,51 @@ int main_inner(int argc, char **argv) {
     }
 #endif
 
-    for (size_t i = 0;; i++) {
+    for (size_t i = 0; !g_interrupted; ++i) {
         if (threads != 0) {
             std::lock_guard lock(cpu_outputs.mutex);
             while (!cpu_outputs.queue.empty()) {
                 auto output = cpu_outputs.queue.front();
                 cpu_outputs.queue.pop();
-                std::printf("%" PRIi64 " at %" PRIi32 " %" PRIi32 " with %" PRIi32 "\n", output.seed, output.x, output.z, output.score);
-                std::fprintf(output_file, "%" PRIi64 " %" PRIi32 " %" PRIi32 " %" PRIi32 "\n", output.seed, output.x, output.z, output.score);
-                std::fflush(output_file);
+                print_result_card(SearchResult{static_cast<int64_t>(output.seed), output.x, output.z, output.score}, large_biomes);
+                if (output_file != nullptr) {
+                    write_result_line(output_file, SearchResult{static_cast<int64_t>(output.seed), output.x, output.z, output.score});
+                }
             }
         }
 
         if (args.devices.size() == 0 && i % 10 == 0) {
             std::lock_guard lock(gpu_outputs.mutex);
-            std::printf("gpu_outputs.queue.size() = %zu\n", gpu_outputs.queue.size());
+            std::printf("[status] queued GPU outputs: %zu\n", gpu_outputs.queue.size());
+        }
+
+        if (args.stop_seed.has_value()) {
+            bool all_gpus_done = true;
+#ifndef NO_GPU
+            for (auto &thread : gpu_threads) {
+                if (!thread->is_done()) {
+                    all_gpus_done = false;
+                    break;
+                }
+            }
+#endif
+            if (all_gpus_done) {
+                bool gpu_queue_empty = false;
+                {
+                    std::lock_guard lock(gpu_outputs.mutex);
+                    gpu_queue_empty = gpu_outputs.queue.empty();
+                }
+                if (gpu_queue_empty) {
+                    break;
+                }
+            }
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    if (g_interrupted) {
+        std::fprintf(stderr, "\nCtrl+C received, stopping...\n");
     }
 
 #ifndef NO_GPU
@@ -302,10 +503,26 @@ int main_inner(int argc, char **argv) {
     }
 #endif
 
+    if (threads != 0) {
+        std::lock_guard lock(cpu_outputs.mutex);
+        while (!cpu_outputs.queue.empty()) {
+            auto output = cpu_outputs.queue.front();
+            cpu_outputs.queue.pop();
+            print_result_card(SearchResult{static_cast<int64_t>(output.seed), output.x, output.z, output.score}, large_biomes);
+            if (output_file != nullptr) {
+                write_result_line(output_file, SearchResult{static_cast<int64_t>(output.seed), output.x, output.z, output.score});
+            }
+        }
+    }
+
     if (output_file != nullptr) {
+        std::fflush(output_file);
         std::fclose(output_file);
     }
 
+    if (threads != 0) {
+        print_top_results_from_file(output_file_path, large_biomes);
+    }
     return 0;
 }
 
