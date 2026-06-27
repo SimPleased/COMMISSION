@@ -82,6 +82,7 @@ struct Args {
     std::optional<HostService> server;
     std::optional<std::string> output_file;
     std::optional<int64_t> start_seed;
+    std::optional<int64_t> stop_seed;
     std::optional<int32_t> min_size;
 
     bool parse(int argc, const char **const argv) {
@@ -130,6 +131,8 @@ struct Args {
                 output_file = argv[i++];
             } else if (std::strcmp("--start", arg) == 0) {
                 if (!parse_argument_int(argc, argv, i, start_seed, [](int64_t start_seed){ return true; }, arg)) return false;
+            } else if (std::strcmp("--stop", arg) == 0) {
+                if (!parse_argument_int(argc, argv, i, stop_seed, [](int64_t stop_seed){ return true; }, arg)) return false;
             } else if (std::strcmp("--size", arg) == 0) {
                 if (!parse_argument_int(argc, argv, i, min_size, [](int32_t min_size){ return min_size >= 0; }, arg)) return false;
             } else {
@@ -174,7 +177,7 @@ uint64_t random_start_seed() {
 int main_inner(int argc, char **argv) {
     Args args{};
     if (!args.parse(argc, const_cast<const char **const>(argv))) {
-        std::fprintf(stderr, "Usage:\n%s [--device <device>,<device>,...] [--threads <threads>] [--client <server_address>] [--server <listen_address>] [--output <output_file>] [--start <start_seed>] [--size <min_size>]\n", argv[0]);
+        std::fprintf(stderr, "Usage:\n%s [--device <device>,<device>,...] [--threads <threads>] [--client <server_address>] [--server <listen_address>] [--output <output_file>] [--start <start_seed>] [--stop <stop_seed>] [--size <min_size>]\n", argv[0]);
         return 1;
     }
 
@@ -217,7 +220,7 @@ int main_inner(int argc, char **argv) {
 #ifndef NO_GPU
     uint64_t start_seed = args.start_seed.value_or(random_start_seed());
     std::printf("Starting from %" PRIi64 "\n", start_seed);
-    SeedIterator seed_range(start_seed);
+    SeedIterator seed_range(start_seed, args.stop_seed);
 
     std::vector<std::unique_ptr<GpuThread>> gpu_threads;
     for (int device : args.devices) {
@@ -259,6 +262,28 @@ int main_inner(int argc, char **argv) {
         if (args.devices.size() == 0 && i % 10 == 0) {
             std::lock_guard lock(gpu_outputs.mutex);
             std::printf("gpu_outputs.queue.size() = %zu\n", gpu_outputs.queue.size());
+        }
+
+        if (args.stop_seed.has_value()) {
+            bool all_gpus_done = true;
+#ifndef NO_GPU
+            for (auto &thread : gpu_threads) {
+                if (!thread->is_done()) {
+                    all_gpus_done = false;
+                    break;
+                }
+            }
+#endif
+            if (all_gpus_done) {
+                bool gpu_queue_empty = false;
+                {
+                    std::lock_guard lock(gpu_outputs.mutex);
+                    gpu_queue_empty = gpu_outputs.queue.empty();
+                }
+                if (gpu_queue_empty) {
+                    break;
+                }
+            }
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(1));
