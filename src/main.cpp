@@ -273,7 +273,7 @@ void print_result_card(const SearchResult &r, bool large_biomes, size_t rank = 0
     std::printf("seed=%" PRIi64 "  x=%" PRIi32 "  z=%" PRIi32 "  size=%" PRIi32 "\n",
                 r.seed, r.x, r.z, r.size);
     std::printf("   Chunkbase : %s\n", make_chunkbase_url(r.seed, r.x, r.z, large_biomes).c_str());
-    std::printf("   tmcseedmap : %s\n", make_mcseedmap_url(r.seed, r.x, r.z, large_biomes).c_str());
+    std::printf("   mcseedmap : %s\n", make_mcseedmap_url(r.seed, r.x, r.z, large_biomes).c_str());
 }
 
 void print_top_results_from_file(const std::string &path, bool large_biomes) {
@@ -380,7 +380,7 @@ int main_inner(int argc, char **argv) {
             std::fprintf(stderr, "Could not open %s\n", output_file_path.c_str());
             return 1;
         }
-        std::setvbuf(output_file, nullptr, _IOFBF, 1 << 20);
+        std::setvbuf(output_file, nullptr, _IOLBF, BUFSIZ);
         std::fprintf(output_file, "\n");
         std::fflush(output_file);
     }
@@ -427,6 +427,7 @@ int main_inner(int argc, char **argv) {
                 print_result_card(SearchResult{static_cast<int64_t>(output.seed), output.x, output.z, output.score}, large_biomes);
                 if (output_file != nullptr) {
                     write_result_line(output_file, SearchResult{static_cast<int64_t>(output.seed), output.x, output.z, output.score});
+                    std::fflush(output_file);
                 }
             }
         }
@@ -511,6 +512,7 @@ int main_inner(int argc, char **argv) {
             print_result_card(SearchResult{static_cast<int64_t>(output.seed), output.x, output.z, output.score}, large_biomes);
             if (output_file != nullptr) {
                 write_result_line(output_file, SearchResult{static_cast<int64_t>(output.seed), output.x, output.z, output.score});
+                std::fflush(output_file);
             }
         }
     }
