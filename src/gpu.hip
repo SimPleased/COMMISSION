@@ -776,7 +776,7 @@ void run_fine(InputBuffer<uint64_t> input, NoiseCache *noise_caches, InputBuffer
 
 namespace SeedPreFilter {
 constexpr uint32_t THREADS_PER_BLOCK = 256;
-constexpr uint32_t SEED_BATCH_SIZE = UINT64_C(1) << 28;
+constexpr uint32_t SEED_BATCH_SIZE = UINT64_C(1) << 31;
 
 constexpr XrsrForkHash hash_for_y_offset_fork(XrsrForkHash hash) {
   XrsrRandom rng{hash.lo, hash.hi};
@@ -1390,101 +1390,117 @@ __global__ __launch_bounds__(C::THREADS_PER_BLOCK) void coarse_octave_filter_ker
   static_assert(sizeof(MinecraftImprovedNoise) % sizeof(uint4) == 0);
 
   const uint32_t input_count = *inputs.len;
-  for (uint32_t input_index = warp_global_idx; input_index < input_count; input_index += total_warps) {
-    const SeedPosition input = inputs.data[input_index];
-    const uint32_t seed_index = input.seed_index;
+
+  const uint32_t total_iterations = (input_count + total_warps - 1) / total_warps;
+
+  for (uint32_t iter = 0; iter < total_iterations; ++iter) {
+    const uint32_t input_index = iter * total_warps + warp_global_idx;
+    const bool is_valid = input_index < input_count;
+
+    SeedPosition input = {};
+    uint32_t seed_index = 0;
+    
+    if (is_valid) {
+      input = inputs.data[input_index];
+      seed_index = input.seed_index;
+    }
 
     {
-      const uint4 *source_ptr_oct0;
-      const uint4 *source_ptr_oct1;
-      if constexpr (C::is_a) {
-        source_ptr_oct0 = reinterpret_cast<const uint4 *>(&noise_caches[seed_index].octaves[0]);
-        source_ptr_oct1 = reinterpret_cast<const uint4 *>(&noise_caches[seed_index].octaves[2]);
-      } else {
-        source_ptr_oct0 = reinterpret_cast<const uint4 *>(&noise_caches[seed_index].octaves[1]);
-        source_ptr_oct1 = reinterpret_cast<const uint4 *>(&noise_caches[seed_index].octaves[3]);
+      const uint4 *source_ptr_oct0 = nullptr;
+      const uint4 *source_ptr_oct1 = nullptr;
+      if (is_valid) {
+        if constexpr (C::is_a) {
+          source_ptr_oct0 = reinterpret_cast<const uint4 *>(&noise_caches[seed_index].octaves[0]);
+          source_ptr_oct1 = reinterpret_cast<const uint4 *>(&noise_caches[seed_index].octaves[2]);
+        } else {
+          source_ptr_oct0 = reinterpret_cast<const uint4 *>(&noise_caches[seed_index].octaves[1]);
+          source_ptr_oct1 = reinterpret_cast<const uint4 *>(&noise_caches[seed_index].octaves[3]);
+        }
       }
       uint4 *dest_ptr_oct0 = reinterpret_cast<uint4 *>(&noise_oct0);
       uint4 *dest_ptr_oct1 = reinterpret_cast<uint4 *>(&noise_oct1);
-      if (lane_id < uint4_words_per_noise) {
+      if (is_valid && lane_id < uint4_words_per_noise) {
         dest_ptr_oct0[lane_id] = source_ptr_oct0[lane_id];
         dest_ptr_oct1[lane_id] = source_ptr_oct1[lane_id];
       }
     }
     __syncwarp();
 
-    const float octave0_xo = noise_oct0.xo;
-    const float octave0_yo = noise_oct0.yo;
-    const float octave0_zo = noise_oct0.zo;
-    const float octave1_xo = noise_oct1.xo;
-    const float octave1_yo = noise_oct1.yo;
-    const float octave1_zo = noise_oct1.zo;
-
-    const int32_t z_world = input.z + (int32_t)(z_sample_idx * C::POSITION_STEP) + C::POSITION_OFFSET;
-    const int32_t x_base = input.x + (int32_t)(x_start_sample_idx * C::POSITION_STEP) + C::POSITION_OFFSET;
-
-    int32_t grid_y0, grid_z0, grid_y1, grid_z1;
-    float frac_y0, frac_z0, frac_y1, frac_z1;
-    float fade_y0, fade_z0, fade_y1, fade_z1;
-
-    compute_perlin_coords(octave0_yo, grid_y0, frac_y0, fade_y0);
-    compute_perlin_coords(z_world * C::freq_mult_0 + octave0_zo, grid_z0, frac_z0, fade_z0);
-
-    compute_perlin_coords(octave1_yo, grid_y1, frac_y1, fade_y1);
-    compute_perlin_coords(z_world * C::freq_mult_1 + octave1_zo, grid_z1, frac_z1, fade_z1);
-
-    int32_t last_grid_x0 = 0;
-    int32_t last_grid_x1 = 0;
-    bool is_x0_cached = false;
-    bool is_x1_cached = false;
-    
-    uint8_t octave0_corner_000, octave0_corner_100, octave0_corner_010, octave0_corner_110;
-    uint8_t octave0_corner_001, octave0_corner_101, octave0_corner_011, octave0_corner_111;
-    
-    uint8_t octave1_corner_000, octave1_corner_100, octave1_corner_010, octave1_corner_110;
-    uint8_t octave1_corner_001, octave1_corner_101, octave1_corner_011, octave1_corner_111;
-
     uint32_t local_matches = 0;
-#pragma unroll
-    for (uint32_t sample_offset = 0; sample_offset < 8; sample_offset++) {
-      const int32_t x_world = x_base + (int32_t)(sample_offset * C::POSITION_STEP);
 
-      int32_t grid_x0;
-      float frac_x0, fade_x0;
-      compute_perlin_coords(x_world * C::freq_mult_0 + octave0_xo, grid_x0, frac_x0, fade_x0);
+    if (is_valid) {
+      const float octave0_xo = noise_oct0.xo;
+      const float octave0_yo = noise_oct0.yo;
+      const float octave0_zo = noise_oct0.zo;
+      const float octave1_xo = noise_oct1.xo;
+      const float octave1_yo = noise_oct1.yo;
+      const float octave1_zo = noise_oct1.zo;
+
+      const int32_t z_world = input.z + (int32_t)(z_sample_idx * C::POSITION_STEP) + C::POSITION_OFFSET;
+      const int32_t x_base = input.x + (int32_t)(x_start_sample_idx * C::POSITION_STEP) + C::POSITION_OFFSET;
+
+      int32_t grid_y0, grid_z0, grid_y1, grid_z1;
+      float frac_y0, frac_z0, frac_y1, frac_z1;
+      float fade_y0, fade_z0, fade_y1, fade_z1;
+
+      compute_perlin_coords(octave0_yo, grid_y0, frac_y0, fade_y0);
+      compute_perlin_coords(z_world * C::freq_mult_0 + octave0_zo, grid_z0, frac_z0, fade_z0);
+
+      compute_perlin_coords(octave1_yo, grid_y1, frac_y1, fade_y1);
+      compute_perlin_coords(z_world * C::freq_mult_1 + octave1_zo, grid_z1, frac_z1, fade_z1);
+
+      int32_t last_grid_x0 = 0;
+      int32_t last_grid_x1 = 0;
+      bool is_x0_cached = false;
+      bool is_x1_cached = false;
       
-      if (!is_x0_cached || grid_x0 != last_grid_x0) {
-        compute_cell(noise_oct0, grid_x0, grid_y0, grid_z0, 
-                     octave0_corner_000, octave0_corner_100, octave0_corner_010, octave0_corner_110, 
-                     octave0_corner_001, octave0_corner_101, octave0_corner_011, octave0_corner_111);
-        last_grid_x0 = grid_x0;
-        is_x0_cached = true;
+      uint8_t octave0_corner_000, octave0_corner_100, octave0_corner_010, octave0_corner_110;
+      uint8_t octave0_corner_001, octave0_corner_101, octave0_corner_011, octave0_corner_111;
+      
+      uint8_t octave1_corner_000, octave1_corner_100, octave1_corner_010, octave1_corner_110;
+      uint8_t octave1_corner_001, octave1_corner_101, octave1_corner_011, octave1_corner_111;
+
+#pragma unroll
+      for (uint32_t sample_offset = 0; sample_offset < 8; sample_offset++) {
+        const int32_t x_world = x_base + (int32_t)(sample_offset * C::POSITION_STEP);
+
+        int32_t grid_x0;
+        float frac_x0, fade_x0;
+        compute_perlin_coords(x_world * C::freq_mult_0 + octave0_xo, grid_x0, frac_x0, fade_x0);
+        
+        if (!is_x0_cached || grid_x0 != last_grid_x0) {
+          compute_cell(noise_oct0, grid_x0, grid_y0, grid_z0, 
+                       octave0_corner_000, octave0_corner_100, octave0_corner_010, octave0_corner_110, 
+                       octave0_corner_001, octave0_corner_101, octave0_corner_011, octave0_corner_111);
+          last_grid_x0 = grid_x0;
+          is_x0_cached = true;
+        }
+        const float noise_val_octave0 = trilinear_interp(frac_x0, frac_y0, frac_z0, fade_x0, fade_y0, fade_z0, 
+                                               octave0_corner_000, octave0_corner_100, octave0_corner_010, octave0_corner_110, 
+                                               octave0_corner_001, octave0_corner_101, octave0_corner_011, octave0_corner_111);
+
+        int32_t grid_x1;
+        float frac_x1, fade_x1;
+        compute_perlin_coords(x_world * C::freq_mult_1 + octave1_xo, grid_x1, frac_x1, fade_x1);
+
+        if (!is_x1_cached || grid_x1 != last_grid_x1) {
+          compute_cell(noise_oct1, grid_x1, grid_y1, grid_z1, 
+                       octave1_corner_000, octave1_corner_100, octave1_corner_010, octave1_corner_110, 
+                       octave1_corner_001, octave1_corner_101, octave1_corner_011, octave1_corner_111);
+          last_grid_x1 = grid_x1;
+          is_x1_cached = true;
+        }
+        const float noise_val_octave1 = trilinear_interp(frac_x1, frac_y1, frac_z1, fade_x1, fade_y1, fade_z1, 
+                                               octave1_corner_000, octave1_corner_100, octave1_corner_010, octave1_corner_110, 
+                                               octave1_corner_001, octave1_corner_101, octave1_corner_011, octave1_corner_111);
+
+        float combined_noise_val = noise_val_octave0 * C::amp_mult_0 + noise_val_octave1 * C::amp_mult_1;
+        local_matches += (combined_noise_val < C::noise_threshold) ? 1u : 0u;
       }
-      const float noise_val_octave0 = trilinear_interp(frac_x0, frac_y0, frac_z0, fade_x0, fade_y0, fade_z0, 
-                                             octave0_corner_000, octave0_corner_100, octave0_corner_010, octave0_corner_110, 
-                                             octave0_corner_001, octave0_corner_101, octave0_corner_011, octave0_corner_111);
-
-      int32_t grid_x1;
-      float frac_x1, fade_x1;
-      compute_perlin_coords(x_world * C::freq_mult_1 + octave1_xo, grid_x1, frac_x1, fade_x1);
-
-      if (!is_x1_cached || grid_x1 != last_grid_x1) {
-        compute_cell(noise_oct1, grid_x1, grid_y1, grid_z1, 
-                     octave1_corner_000, octave1_corner_100, octave1_corner_010, octave1_corner_110, 
-                     octave1_corner_001, octave1_corner_101, octave1_corner_011, octave1_corner_111);
-        last_grid_x1 = grid_x1;
-        is_x1_cached = true;
-      }
-      const float noise_val_octave1 = trilinear_interp(frac_x1, frac_y1, frac_z1, fade_x1, fade_y1, fade_z1, 
-                                             octave1_corner_000, octave1_corner_100, octave1_corner_010, octave1_corner_110, 
-                                             octave1_corner_001, octave1_corner_101, octave1_corner_011, octave1_corner_111);
-
-      float combined_noise_val = noise_val_octave0 * C::amp_mult_0 + noise_val_octave1 * C::amp_mult_1;
-      local_matches += (combined_noise_val < C::noise_threshold) ? 1u : 0u;
     }
 
     const uint32_t total_warp_matches = reduce_add_32(local_matches);
-    if (lane_id == 0 && total_warp_matches >= C::min_count) {
+    if (is_valid && lane_id == 0 && total_warp_matches >= C::min_count) {
       uint32_t result_index = atomicAdd(outputs.len, 1);
       if (result_index < outputs.max_len) {
         outputs.data[result_index] = {seed_index, input.x, input.z};
